@@ -2,3 +2,5 @@
 
 g++ -fopenmp -O3 -o main .\cluster_grav.cc
 .\main input1.txt
+
+sqrt(pow((distance*distance + EPSILON*EPSILON), 3))

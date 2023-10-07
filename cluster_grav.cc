@@ -4,8 +4,9 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <iostream>
+#include <cstring>
 
-constexpr double EPSILON = 0.001;
+constexpr double EPSILON = 0.01;
 
 // It would be cleaner to put seed and Gaussian_point into this class,
 // but this allows them to be called like regular C functions.
@@ -30,11 +31,30 @@ Gaussian_point (double *out, unit_normal *un, int D, double *mean, double sd) {
     return out;
 }
 
+double getMean(double **points, int N, int D){
+    double sum = 0.0;
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            double sqrt_sum = 0.0;
+            for (int k=0; k<D; k++){
+                double d = points[i][k] - points[j][k];
+                sqrt_sum += d * d;
+            }
+            sum += sqrt(sqrt_sum);
+        }
+    }
+
+    return sum / N / N;
+    
+}
+
 double compute_variance(double **points, int N, int D){
     double total[D];
     double average[D];
-    double squaredDiffs[D] = {};
+    double squaredDiffs[D];
     double sum = 0.0;
+
+    memset(total, 0, D*sizeof(*total));
     
     for (int i=0; i<N; i++){
         for (int j=0; j<D; j++){
@@ -44,9 +64,10 @@ double compute_variance(double **points, int N, int D){
 
     for (int i=0; i<D; i++){
         average[i] = total[i] / N;
+        squaredDiffs[i] = 0.0;
     }
-    for (int i = 0; i < N; ++i) {
-        for (int j = 0; j < D; ++j) {
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < D; j++) {
             double diff = points[i][j] - average[j];
             squaredDiffs[j] += diff * diff;
         }
@@ -185,11 +206,11 @@ main (int argc, char *argv[])
             }
         }
 
-        const double dt = 0.1;
+        const double dt = 0.01;
         int loops = 20000000;
         // Gravitational constant
         const double G = 6.67430e-11;
-        const double MASS = 3000.0;
+        const double MASS = 1000.0;
 
         // velocity
         double *velocity_data = (double*)malloc(N*D * sizeof(*velocity_data));
@@ -203,7 +224,8 @@ main (int argc, char *argv[])
 
         
         // stimulate gravity
-
+        double mean = getMean(points, N, D);
+        printf("mean distance: %lf\n", mean);
         
         double startVariance = compute_variance(points, N, D);
         printf("stimulation starts, current variance: %lf\n", startVariance);
@@ -211,7 +233,15 @@ main (int argc, char *argv[])
             loops--;
             #pragma omp parallel for
             for (int i = 0; i < N; i++) {
-                double f[D] = {};
+                double f[D];
+                memset(f, 0, D*sizeof(*f));
+                for (int i = 0; i < N; i++){
+                    for (int j = 0; j < D; j++) {
+                        
+                        points[i][j] += velocity[i][j] * dt;
+                    }
+                }
+
                 for (int j = 0; j < N; j++) {
                     if (i == j) continue;
                     double distance_sqrt = 0.0;
@@ -221,8 +251,8 @@ main (int argc, char *argv[])
                         distance_sqrt += d[k]*d[k];
                     }
                     double distance = sqrt(distance_sqrt);
-
-                    double force_magnitude = (G * MASS * MASS) / (distance*distance + EPSILON);
+                    if (distance == 0) continue;
+                    double force_magnitude = (G * MASS * MASS) / pow((distance*distance + EPSILON*EPSILON), 1);
                     
                     // printf ("%lf \n", G);
 
@@ -236,33 +266,24 @@ main (int argc, char *argv[])
                 }
             }
 
-            for (int i = 0; i < N; i++){
-                for (int j = 0; j < D; j++) {
-                    
-                    points[i][j] += velocity[i][j] * dt;
-                }
-            }
+            
             // for (int i = 0; i < N; i++){for (int j = 0; j < D; j++) {printf ("%lf ", points[i][j]);}printf ("\n");}
-            count++;
+            count += 1;
             double variance = compute_variance(points, N, D);
-            if (startVariance / variance > 4){
+            // printf("current variance: %lf\n", variance);
+            double factor = startVariance / variance;
+            if (factor > 4.0){
                 printf("current variance: %lf\n", variance);
                 printf("end\n");
                 return 0;
-            } else if (variance / startVariance > 4){
+            } else if (factor < 0.1){
+                printf("failed, start variance: %lf, current variance: %lf, factor: %lf\n", startVariance, variance, factor);
                 printf("current variance: %lf\n", variance);
                 printf("failed\n");
                 return 0;
             }
             if (count == 100){
                 printf("current variance: %lf\n", variance);
-                if (startVariance / variance > 4){
-                    printf("end\n");
-                    return 0;
-                } else if (variance / startVariance > 4){
-                    printf("failed\n");
-                    return 0;
-                }
                 count =  0;
             }
             
