@@ -44,5 +44,6 @@
         "typeinfo": "cpp",
         "iostream": "cpp",
         "istream": "cpp"
-    }
+    },
+    "C_Cpp.default.compilerPath": ""
 }

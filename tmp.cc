@@ -5,8 +5,6 @@
 #include <stdexcept>
 #include <iostream>
 
-constexpr double EPSILON = 0.001;
-
 // It would be cleaner to put seed and Gaussian_point into this class,
 // but this allows them to be called like regular C functions.
 // Feel free to make the whole code more C++-like.
@@ -60,17 +58,6 @@ double compute_variance(double **points, int N, int D){
     
 }
 
-int findCumulativeProbabilityIndex(double *gmm_probs, int c, int index, int N){
-    double cumulativeSum = 0.0;
-    for (int i = 0; i < c; i++){
-        cumulativeSum += gmm_probs[i] * N;
-        if (cumulativeSum > index){
-            return i;
-        }
-    }
-    return c-1;
-}
-
 
 
 int
@@ -120,14 +107,10 @@ main (int argc, char *argv[])
     try {
         printf ("real code starts\n");
         double *points_data = (double*)malloc(N*D * sizeof(*points_data));
-        double **points  = (double**)malloc(N * sizeof(*points));
-
-        int gmm_index;
+        double **points  = (double**)malloc(N * sizeof(*points)); 
         for (int i = 0; i < N; i++) {
             points[i] = &(points_data[i * D]);
-            gmm_index = findCumulativeProbabilityIndex(gmm_probs, c, i, N);
-            printf ("gmm_index: %d ", gmm_index);
-            Gaussian_point (points[i], &un, D, gmm_means[gmm_index], gmm_stddevs[gmm_index]);
+            Gaussian_point (points[i], &un, D, gmm_means[c-1], gmm_stddevs[c-1]);
             for (int j = 0; j < D; j++) {
                 printf ("%lf ", points[i][j]);
             }
@@ -185,11 +168,11 @@ main (int argc, char *argv[])
             }
         }
 
-        const double dt = 0.1;
-        int loops = 20000000;
+        const double dt = 0.01;
+        int loops = 50000;
         // Gravitational constant
         const double G = 6.67430e-11;
-        const double MASS = 3000.0;
+        const double MASS = 1000.0;
 
         // velocity
         double *velocity_data = (double*)malloc(N*D * sizeof(*velocity_data));
@@ -204,12 +187,9 @@ main (int argc, char *argv[])
         
         // stimulate gravity
 
-        
-        double startVariance = compute_variance(points, N, D);
-        printf("stimulation starts, current variance: %lf\n", startVariance);
+        printf("stimulation starts, current variance: %lf\n", compute_variance(points, N, D));
         while(loops){
             loops--;
-            #pragma omp parallel for
             for (int i = 0; i < N; i++) {
                 double f[D] = {};
                 for (int j = 0; j < N; j++) {
@@ -221,8 +201,9 @@ main (int argc, char *argv[])
                         distance_sqrt += d[k]*d[k];
                     }
                     double distance = sqrt(distance_sqrt);
+                    if (distance <= 0.01) continue;
 
-                    double force_magnitude = (G * MASS * MASS) / (distance*distance + EPSILON);
+                    double force_magnitude = (G * MASS * MASS) / (distance*distance);
                     
                     // printf ("%lf \n", G);
 
@@ -244,32 +225,15 @@ main (int argc, char *argv[])
             }
             // for (int i = 0; i < N; i++){for (int j = 0; j < D; j++) {printf ("%lf ", points[i][j]);}printf ("\n");}
             count++;
-            double variance = compute_variance(points, N, D);
-            if (startVariance / variance > 4){
-                printf("current variance: %lf\n", variance);
-                printf("end\n");
-                return 0;
-            } else if (variance / startVariance > 4){
-                printf("current variance: %lf\n", variance);
-                printf("failed\n");
-                return 0;
-            }
             if (count == 100){
+                double variance = compute_variance(points, N, D);
                 printf("current variance: %lf\n", variance);
-                if (startVariance / variance > 4){
-                    printf("end\n");
-                    return 0;
-                } else if (variance / startVariance > 4){
-                    printf("failed\n");
-                    return 0;
-                }
                 count =  0;
             }
             
 
         }
     }catch (const std::exception& e){
-        printf("failed\n");
         std::cerr << "Error: " << e.what() << std::endl;
     }
 }
