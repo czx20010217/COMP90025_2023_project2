@@ -4,6 +4,9 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <iostream>
+#include <cstring>
+
+constexpr double EPSILON = 0.01;
 
 // It would be cleaner to put seed and Gaussian_point into this class,
 // but this allows them to be called like regular C functions.
@@ -28,11 +31,30 @@ Gaussian_point (double *out, unit_normal *un, int D, double *mean, double sd) {
     return out;
 }
 
+double getMean(double **points, int N, int D){
+    double sum = 0.0;
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            double sqrt_sum = 0.0;
+            for (int k=0; k<D; k++){
+                double d = points[i][k] - points[j][k];
+                sqrt_sum += d * d;
+            }
+            sum += sqrt(sqrt_sum);
+        }
+    }
+
+    return sum / N / N;
+    
+}
+
 double compute_variance(double **points, int N, int D){
     double total[D];
     double average[D];
-    double squaredDiffs[D] = {};
+    double squaredDiffs[D];
     double sum = 0.0;
+
+    memset(total, 0, D*sizeof(*total));
     
     for (int i=0; i<N; i++){
         for (int j=0; j<D; j++){
@@ -42,9 +64,10 @@ double compute_variance(double **points, int N, int D){
 
     for (int i=0; i<D; i++){
         average[i] = total[i] / N;
+        squaredDiffs[i] = 0.0;
     }
-    for (int i = 0; i < N; ++i) {
-        for (int j = 0; j < D; ++j) {
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < D; j++) {
             double diff = points[i][j] - average[j];
             squaredDiffs[j] += diff * diff;
         }
@@ -56,6 +79,17 @@ double compute_variance(double **points, int N, int D){
 
     return sum / N;
     
+}
+
+int findCumulativeProbabilityIndex(double *gmm_probs, int c, int index, int N){
+    double cumulativeSum = 0.0;
+    for (int i = 0; i < c; i++){
+        cumulativeSum += gmm_probs[i] * N;
+        if (cumulativeSum > index){
+            return i;
+        }
+    }
+    return c-1;
 }
 
 
@@ -107,10 +141,14 @@ main (int argc, char *argv[])
     try {
         printf ("real code starts\n");
         double *points_data = (double*)malloc(N*D * sizeof(*points_data));
-        double **points  = (double**)malloc(N * sizeof(*points)); 
+        double **points  = (double**)malloc(N * sizeof(*points));
+
+        int gmm_index;
         for (int i = 0; i < N; i++) {
             points[i] = &(points_data[i * D]);
-            Gaussian_point (points[i], &un, D, gmm_means[c-1], gmm_stddevs[c-1]);
+            gmm_index = findCumulativeProbabilityIndex(gmm_probs, c, i, N);
+            printf ("gmm_index: %d ", gmm_index);
+            Gaussian_point (points[i], &un, D, gmm_means[gmm_index], gmm_stddevs[gmm_index]);
             for (int j = 0; j < D; j++) {
                 printf ("%lf ", points[i][j]);
             }
@@ -169,7 +207,7 @@ main (int argc, char *argv[])
         }
 
         const double dt = 0.01;
-        int loops = 50000;
+        int loops = 20000000;
         // Gravitational constant
         const double G = 6.67430e-11;
         const double MASS = 1000.0;
@@ -186,12 +224,24 @@ main (int argc, char *argv[])
 
         
         // stimulate gravity
-
-        printf("stimulation starts, current variance: %lf\n", compute_variance(points, N, D));
+        double mean = getMean(points, N, D);
+        printf("mean distance: %lf\n", mean);
+        
+        double startVariance = compute_variance(points, N, D);
+        printf("stimulation starts, current variance: %lf\n", startVariance);
         while(loops){
             loops--;
+            #pragma omp parallel for
             for (int i = 0; i < N; i++) {
-                double f[D] = {};
+                double f[D];
+                memset(f, 0, D*sizeof(*f));
+                for (int i = 0; i < N; i++){
+                    for (int j = 0; j < D; j++) {
+                        
+                        points[i][j] += velocity[i][j] * dt;
+                    }
+                }
+
                 for (int j = 0; j < N; j++) {
                     if (i == j) continue;
                     double distance_sqrt = 0.0;
@@ -201,9 +251,8 @@ main (int argc, char *argv[])
                         distance_sqrt += d[k]*d[k];
                     }
                     double distance = sqrt(distance_sqrt);
-                    if (distance <= 0.01) continue;
-
-                    double force_magnitude = (G * MASS * MASS) / (distance*distance);
+                    if (distance == 0) continue;
+                    double force_magnitude = (G * MASS * MASS) / pow((distance*distance + EPSILON*EPSILON), 1);
                     
                     // printf ("%lf \n", G);
 
@@ -217,16 +266,23 @@ main (int argc, char *argv[])
                 }
             }
 
-            for (int i = 0; i < N; i++){
-                for (int j = 0; j < D; j++) {
-                    
-                    points[i][j] += velocity[i][j] * dt;
-                }
-            }
+            
             // for (int i = 0; i < N; i++){for (int j = 0; j < D; j++) {printf ("%lf ", points[i][j]);}printf ("\n");}
-            count++;
+            count += 1;
+            double variance = compute_variance(points, N, D);
+            // printf("current variance: %lf\n", variance);
+            double factor = startVariance / variance;
+            if (factor > 4.0){
+                printf("current variance: %lf\n", variance);
+                printf("end\n");
+                return 0;
+            } else if (factor < 0.1){
+                printf("failed, start variance: %lf, current variance: %lf, factor: %lf\n", startVariance, variance, factor);
+                printf("current variance: %lf\n", variance);
+                printf("failed\n");
+                return 0;
+            }
             if (count == 100){
-                double variance = compute_variance(points, N, D);
                 printf("current variance: %lf\n", variance);
                 count =  0;
             }
@@ -234,6 +290,7 @@ main (int argc, char *argv[])
 
         }
     }catch (const std::exception& e){
+        printf("failed\n");
         std::cerr << "Error: " << e.what() << std::endl;
     }
 }
