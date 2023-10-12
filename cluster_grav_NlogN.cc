@@ -8,10 +8,12 @@
 #include <mpi.h>
 #include <omp.h>
 #include <assert.h>
+#include <unistd.h> 
 
-constexpr double EPSILON = 0.1;
+constexpr double EPSILON = 0.01;
 const MPI_Comm comm = MPI_COMM_WORLD;
 const int root = 0;
+const double MASS = 1000.0;
 
 // It would be cleaner to put seed and Gaussian_point into this class,
 // but this allows them to be called like regular C functions.
@@ -101,7 +103,119 @@ void compute_velocity(double **points, double **velocity, double N, double D){
     return;
 }
 
+struct QuadTreeNode {
+    std::vector<double> center;
+    double size;
+    double mass;
+    double* point;
+    std::vector<QuadTreeNode*> children;
 
+    QuadTreeNode(const std::vector<double>& center, double size) : size(size) {
+        this->center = center;
+        mass = 0.0;
+        point = nullptr;
+        // printf("default tree children size: %d\n", children.size());
+    }
+
+    ~QuadTreeNode() {
+        for (QuadTreeNode* child : children) {
+            // printf("delete here\n");
+            delete child;
+        }
+    }
+};
+
+void insert(QuadTreeNode* node, double* point, int D, int reinsert) {
+    if (node->mass == 0) {
+        node->mass = 1;
+        node->point = point;
+        return;
+    }else if (!reinsert){
+        node->mass += 1;
+    }
+
+    if (node->point != nullptr) {
+        // If the node already contains a point, split it and redistribute
+        double* old_point = node->point;
+        node->point = nullptr;
+        for (int i = 0; i < (1 << D); i++) { // generate 2**D child
+            std::vector<double> newCenter(node->center);
+            for (size_t j = 0; j < D; j++) {
+                newCenter[j] += (i & (1 << j) ? 0.25 : -0.25) * node->size; // use a binary representation for children to compute center
+            }
+            node->children.push_back(new QuadTreeNode(newCenter, node->size * 0.5)); // insert children into the tree
+        }
+        insert(node, old_point, D, 1); // reinsert the point to children
+    }
+
+    std::vector<int> pointPosition(D, 0.0);
+    for (size_t i = 0; i < D; i++) {
+        pointPosition[i] = (point[i] >= node->center[i]) ? 1 : 0;
+    }
+
+    int index = 0;
+    for (size_t i = 0; i < pointPosition.size(); i++) {
+        index |= (pointPosition[i] << i);
+    }
+    insert(node->children[index], point, D, 0);
+}
+
+void calculate_local_force(QuadTreeNode* node, double* point, int D, double theta, double G, double* force) {
+    double distance = 0.0;
+    for (int i = 0; i < D; i++) {
+        double d = node->center[i] - point[i];
+        distance += d * d;
+    }
+    distance = std::sqrt(distance);
+
+    if (node->point != nullptr && node->point != point) { // leaf node
+        double force_magnitude = G * MASS * MASS / (distance * distance + EPSILON*EPSILON);
+        for (int i = 0; i < D; i++) {
+            force[i] += force_magnitude * (node->center[i] - point[i]) / distance;
+        }
+    } else if (node->size / distance < theta) { // distance large enough
+        double force_magnitude = G * node->mass * MASS / (distance * distance + EPSILON*EPSILON);
+        for (int i = 0; i < D; i++) {
+            force[i] += force_magnitude * (node->center[i] - point[i]) / distance;
+        }
+    } else { // distance too small, use children to compute force
+        for (QuadTreeNode* child : node->children) {
+            if (child != nullptr) {
+                calculate_local_force(child, point, D, theta, G, force);
+            }
+        }
+    }
+}
+
+// replace each node's center with mass center
+void calculate_mass_center(QuadTreeNode* node, int D) {
+    if (node->mass == 0) {
+        return;
+    }
+
+    if (node->point != nullptr){
+        for (int i=0; i<D; i++){
+            node->center[i] = node->point[i] ;
+        }
+        return;
+    }
+
+
+    double mass_center[D];
+    memset(mass_center, 0, D*sizeof(*mass_center));
+
+    for (QuadTreeNode* child : node->children) {
+        if (child != nullptr) {
+            calculate_mass_center(child, D);
+        }
+        for (int i=0; i<D; i++){
+            mass_center[i] += child->mass * child->center[i];
+        }
+    }
+    for (int i=0; i<D; i++){
+        node->center[i] = mass_center[i] / node->mass ;
+    }
+}
 
 int
 main (int argc, char **argv)
@@ -340,17 +454,41 @@ main (int argc, char **argv)
     );
 
     MPI_Barrier(comm);
-    // return 0;
     // if (rank != root) return 0;
-    //for (int i = 0; i < local_size; i++){for (int j = 0; j < D; j++) {printf ("%lf ", cluster_points[i][j]);}printf ("\n");}
-    printf("\n\n\n");
-    //for (int i = 0; i < N; i++){for (int j = 0; j < D; j++) {printf ("%lf ", points[i][j]);}printf ("\n");}
+    // for (int i = 0; i < N; i++){for (int j = 0; j < D; j++) {printf ("%lf ", points[i][j]);}printf ("\n");}
+    // return 0;
+
+    // test tree
+    // use center of cluster as center for tree
+    // if (rank == root){  for (int i = 0; i < N; i++){for (int j = 0; j < D; j++) {printf ("%lf ", points[i][j]);}printf ("\n");} } 
+    std::vector<double> rootCenter(D, 0.0);
+    for (int i = 0; i < D; i++) {
+        rootCenter[i] = centroids[rank][i];
+    }
+
+    QuadTreeNode *tree_root = new QuadTreeNode(rootCenter, 50.0);
+    for (int i = 0; i < local_size; i++) {
+        insert(tree_root, cluster_points[i], D, 0);
+    }
+    calculate_mass_center(tree_root, D); // compute mass center
+    printf("Now on node: %d, total size: %d cluster mass: %lf\n", rank, size, tree_root->mass);
+    delete tree_root;
+
+    double global_mass[K];
+
+    double *mass_center_data = (double*)malloc(K*D * sizeof(*mass_center_data));
+    double **mass_center  = (double**)malloc(K * sizeof(*mass_center));
+    for (int i = 0; i < K; i++) {
+        mass_center[i] = &(mass_center_data[i * D]);
+    }
+    
+
+    // return 0;
 
     const double dt = 0.1;
     int loops = 100000;
     // Gravitational constant
     const double G = 6.67430e-11;
-    const double MASS = 1000.0;
 
     // velocity
     double *velocity_data = (double*)malloc(N*D * sizeof(*velocity_data));
@@ -361,7 +499,6 @@ main (int argc, char **argv)
             velocity[i][j] = 0;
         }
     }
-
     
     // stimulate gravity
     double mean = getMean(points, N, D);
@@ -369,37 +506,52 @@ main (int argc, char **argv)
     
     double startVariance = compute_variance(points, N, D);
     printf("stimulation starts, current variance: %lf\n", startVariance);
-    //
     
+
     int anySolutionFound;
     int isSolutionFound = 0;
     while(loops){
         loops--;
-        #pragma omp parallel for
-        for (int i = 0; i < local_size; i++) { // for each node in cluster
+
+        // Build the tree
+        QuadTreeNode *tree_root = new QuadTreeNode(rootCenter, 50.0);
+        for (int i = 0; i < local_size; i++) {
+            insert(tree_root, cluster_points[i], D, 0);
+        }
+        calculate_mass_center(tree_root, D); // compute mass center
+        double local_mass = tree_root->mass;
+        double local_mass_center[D];
+        for (int j = 0; j < D; j++) {
+            local_mass_center[j] = tree_root->center[j];
+        }
+
+        MPI_Allgather(local_mass_center, D, MPI_DOUBLE, mass_center_data, D, MPI_DOUBLE, comm);
+        MPI_Allgather(&local_mass, 1, MPI_DOUBLE, global_mass, 1, MPI_DOUBLE, comm);
+
+        for (int i = 0; i < local_size; i++) {
             double f[D];
             memset(f, 0, D*sizeof(*f));
 
-            for (int j = 0; j < N; j++) {
-                double distance_sqrt = 0.0;
-                double d[D];
-                for (int k = 0; k < D; k++) {
-                    d[k] = (points[j][k] - cluster_points[i][k]);
-                    distance_sqrt += d[k]*d[k];
-                }
-                double distance = sqrt(distance_sqrt);
-                if (distance == 0) continue;
-                double force_magnitude = (G * MASS * MASS) / pow((distance*distance + EPSILON*EPSILON), 1);
-                
-                // printf ("%lf \n", G);
+            calculate_local_force(tree_root, cluster_points[i], D, 0.5, G, f);
 
-                for (int k = 0; k < D; k++) {
-                    f[k] += force_magnitude * (d[k] / distance);
+            for (int k=0; k < K; k++){
+                if (k == rank) continue;
+                double distance = 0.0;
+                for (int j = 0; j < D; j++) {
+                    double d = mass_center[k][j] - cluster_points[i][j];
+                    distance += d * d;
+                }
+                distance = std::sqrt(distance);
+
+                double force_magnitude = G * global_mass[k] * MASS / (distance * distance + EPSILON*EPSILON);
+                for (int j = 0; j < D; j++) {
+                    f[j] += force_magnitude * (mass_center[k][j] - cluster_points[i][j]) / distance;
                 }
             }
 
-            for (int k = 0; k < D; k++) {
-                velocity[i][k] += f[k] / MASS * dt;
+
+            for (int j = 0; j < D; j++) {
+                velocity[i][j] += f[j] / MASS * dt;
             }
         }
 
@@ -409,6 +561,8 @@ main (int argc, char **argv)
                 cluster_points[i][j] += velocity[i][j] * dt;
             }
         }
+
+        delete tree_root;
 
         MPI_Allgatherv(
             cluster_points_data,
