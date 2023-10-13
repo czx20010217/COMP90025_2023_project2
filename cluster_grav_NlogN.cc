@@ -167,6 +167,7 @@ void calculate_local_force(QuadTreeNode* node, double* point, int D, double thet
         distance += d * d;
     }
     distance = std::sqrt(distance);
+    if (distance == 0) return;
 
     if (node->point != nullptr && node->point != point) { // leaf node
         double force_magnitude = G * MASS * MASS / (distance * distance + EPSILON*EPSILON);
@@ -442,6 +443,12 @@ main (int argc, char **argv)
     }
     //if (rank == root){  for (int i = 0; i < size; i++){printf ("%d ", displacements[i]);}printf ("\n");} 
 
+    int point_displacements[size];
+    point_displacements[0] = 0;
+    for (int i = 1; i < size; i++) {
+        point_displacements[i] = point_displacements[i - 1] + sizes[i - 1];
+    }
+
     MPI_Allgatherv(
         cluster_points_data,
         local_size*D,
@@ -473,20 +480,12 @@ main (int argc, char **argv)
     calculate_mass_center(tree_root, D); // compute mass center
     printf("Now on node: %d, total size: %d cluster mass: %lf\n", rank, size, tree_root->mass);
     delete tree_root;
-
-    double global_mass[K];
-
-    double *mass_center_data = (double*)malloc(K*D * sizeof(*mass_center_data));
-    double **mass_center  = (double**)malloc(K * sizeof(*mass_center));
-    for (int i = 0; i < K; i++) {
-        mass_center[i] = &(mass_center_data[i * D]);
-    }
     
 
     // return 0;
 
     const double dt = 0.1;
-    int loops = 100000;
+    int loops = 10000;
     // Gravitational constant
     const double G = 6.67430e-11;
 
@@ -495,11 +494,21 @@ main (int argc, char **argv)
     double **velocity  = (double**)malloc(N * sizeof(*velocity)); 
     for (int i = 0; i < N; i++) {
         velocity[i] = &(velocity_data[i * D]);
-        for (int j = 0; j < D; j++) {
-            velocity[i][j] = 0;
+    }
+    memset(velocity_data, 0, N*D*sizeof(*velocity_data));
+
+    // global force
+    double *force_data = (double*)malloc(N*D * sizeof(*force_data));
+    memset(force_data, 0, N*D*sizeof(*force_data));
+    double **force  = (double**)malloc(N * sizeof(*force)); 
+    for (int i = 0; i < N; i++) {
+        force[i] = &(force_data[i * D]);
+        for (int j=0; j<D;j++){
+            assert(force[i][j] == 0);
         }
     }
     
+    // if (rank != root) return 0;
     // stimulate gravity
     double mean = getMean(points, N, D);
     printf("mean distance: %lf\n", mean);
@@ -507,11 +516,23 @@ main (int argc, char **argv)
     double startVariance = compute_variance(points, N, D);
     printf("stimulation starts, current variance: %lf\n", startVariance);
     
-
+    int start_index = point_displacements[rank];
+    for (int i = 0; i < local_size; i++) {
+        for (int j=0; j<D;j++){
+            assert(cluster_points[i][j] == points[start_index+i][j]);
+        }
+    }
+    
     int anySolutionFound;
     int isSolutionFound = 0;
     while(loops){
         loops--;
+        memset(force_data, 0, N*D*sizeof(*force_data));
+        for (int i = 0; i < N; i++) {
+            for (int j=0; j<D;j++){
+                assert(force[i][j] == 0);
+            }
+        }
 
         // Build the tree
         QuadTreeNode *tree_root = new QuadTreeNode(rootCenter, 50.0);
@@ -519,46 +540,23 @@ main (int argc, char **argv)
             insert(tree_root, cluster_points[i], D, 0);
         }
         calculate_mass_center(tree_root, D); // compute mass center
-        double local_mass = tree_root->mass;
-        double local_mass_center[D];
-        for (int j = 0; j < D; j++) {
-            local_mass_center[j] = tree_root->center[j];
+
+        for (int i = 0; i < N; i++) {
+            // assert(cluster_points[i][0] == points[start_index+i][0]);
+            calculate_local_force(tree_root, points[i], D, 0.3, G, force[i]);
         }
+        MPI_Allreduce(MPI_IN_PLACE, force_data, N*D, MPI_DOUBLE, MPI_SUM, comm);
 
-        MPI_Allgather(local_mass_center, D, MPI_DOUBLE, mass_center_data, D, MPI_DOUBLE, comm);
-        MPI_Allgather(&local_mass, 1, MPI_DOUBLE, global_mass, 1, MPI_DOUBLE, comm);
-
-        for (int i = 0; i < local_size; i++) {
-            double f[D];
-            memset(f, 0, D*sizeof(*f));
-
-            calculate_local_force(tree_root, cluster_points[i], D, 0.5, G, f);
-
-            for (int k=0; k < K; k++){
-                if (k == rank) continue;
-                double distance = 0.0;
-                for (int j = 0; j < D; j++) {
-                    double d = mass_center[k][j] - cluster_points[i][j];
-                    distance += d * d;
-                }
-                distance = std::sqrt(distance);
-
-                double force_magnitude = G * global_mass[k] * MASS / (distance * distance + EPSILON*EPSILON);
-                for (int j = 0; j < D; j++) {
-                    f[j] += force_magnitude * (mass_center[k][j] - cluster_points[i][j]) / distance;
-                }
-            }
-
-
+        for (int i = 0; i < local_size; i++){
             for (int j = 0; j < D; j++) {
-                velocity[i][j] += f[j] / MASS * dt;
+                velocity[i][j] += force[start_index+i][j] / MASS * dt;
             }
         }
 
         for (int i = 0; i < local_size; i++){
             for (int j = 0; j < D; j++) {
-                
                 cluster_points[i][j] += velocity[i][j] * dt;
+                assert((cluster_points[i][j] <= 20) && (cluster_points[i][j] >= -20));
             }
         }
 
@@ -600,7 +598,7 @@ main (int argc, char **argv)
         }
 
         MPI_Allreduce(&isSolutionFound, &anySolutionFound, 1, MPI_INT, MPI_MAX, comm);
-        if (anySolutionFound) {
+        if (anySolutionFound || isSolutionFound) {
             if (rank == 0) {
                 std::cout << "Root process found the solution." << std::endl;
             }
