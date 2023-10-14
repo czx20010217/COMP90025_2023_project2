@@ -18,6 +18,8 @@ const double MASS = 1000.0;
 const double dt = 1;
 const double G = 6.67430e-11;
 const int MAX_LOOP = 1000;
+const double SIZE = 50.0;
+const double THETA = 0.3;
 
 // It would be cleaner to put seed and Gaussian_point into this class,
 // but this allows them to be called like regular C functions.
@@ -164,6 +166,15 @@ void insert(QuadTreeNode* node, double* point, int D, int reinsert) {
     insert(node->children[index], point, D, 0);
 }
 
+void generate_points(double ** local_points, double *gmm_probs, double **gmm_means, double *gmm_stddevs, int c, int D, int sub_N, unit_normal un){
+    int gmm_index;
+    for (int i = 0; i < sub_N; i++) {
+        gmm_index = findCumulativeProbabilityIndex(gmm_probs, c, i, sub_N);
+        
+        Gaussian_point (local_points[i], &un, D, gmm_means[gmm_index], gmm_stddevs[gmm_index]);
+    }
+}
+
 void calculate_local_force(QuadTreeNode* node, double* point, int D, double theta, double G, double* force) {
     double distance = 0.0;
     for (int i = 0; i < D; i++) {
@@ -222,6 +233,134 @@ void calculate_mass_center(QuadTreeNode* node, int D) {
     }
 }
 
+void update_position(double **points, double** cluster_points, double** velocity, double* force_data, 
+                    double **force, int N, int D, int local_size, int start_index, std::vector<double> root_center){
+
+    // Build the tree
+    QuadTreeNode *tree_root = new QuadTreeNode(root_center, SIZE);
+    for (int i = 0; i < local_size; i++) {
+        insert(tree_root, cluster_points[i], D, 0);
+    }
+    calculate_mass_center(tree_root, D); // compute mass center
+
+    #pragma omp parallel for
+    for (int i = 0; i < N; i++) {
+        calculate_local_force(tree_root, points[i], D, THETA, G, force[i]);
+    }
+    MPI_Allreduce(MPI_IN_PLACE, force_data, N*D, MPI_DOUBLE, MPI_SUM, comm);
+
+    #pragma omp parallel for
+    for (int i = 0; i < local_size; i++){
+        for (int j = 0; j < D; j++) {
+            velocity[i][j] += force[start_index+i][j] / MASS * dt;
+        }
+    }
+
+    #pragma omp parallel for
+    for (int i = 0; i < local_size; i++){
+        for (int j = 0; j < D; j++) {
+            cluster_points[i][j] += velocity[i][j] * dt;
+        }
+    }
+
+    delete tree_root;
+}
+
+void generate_centroids(double** centroids, double** points, double** local_points, int first_centroid_index, int N, int sub_N, int rank, int D, int K){
+    for (int i = 0; i < D; i++) {
+        centroids[0][i] = points[first_centroid_index][i];
+    }
+
+    // Initialize the remaining centroids using k-means++
+    for (int k = 1; k < K; k++) {
+        double weights[N];
+        double total_weights = 0.0;
+        double local_weights[sub_N];
+        double local_total_weight = 0.0;
+
+        // Find the data point farthest from the existing centroids
+        for (int i = 0; i < sub_N; i++) {
+            double min_dist_sqr = INFINITY;
+            
+            // find shortest distance to any centroid
+            for (int j = 0; j < k; j++) {
+                double dist_sqr = 0.0;
+
+                for (int d = 0; d < D; d++) {
+                    double diff = local_points[i][d] - centroids[j][d];
+                    dist_sqr += diff * diff;
+                }
+
+                if (dist_sqr < min_dist_sqr) {
+                    min_dist_sqr = dist_sqr;
+                }
+            }
+
+            local_weights[i] = min_dist_sqr;
+            local_total_weight += local_weights[i];
+        }
+
+        MPI_Gather(local_weights, sub_N, MPI_DOUBLE, weights, sub_N, MPI_DOUBLE, root, comm);
+        MPI_Reduce(&local_total_weight, &total_weights, 1, MPI_DOUBLE, MPI_SUM, root, comm);
+
+        if (rank == root) {
+            double tmp = 0.0;
+            for (int i = 0; i < N; i++){
+                tmp += weights[i];
+            }
+        }
+
+        int next_centroid_index;
+
+        if (rank == root) {
+            // Set the next centroid to the selected data point
+            double random_value = static_cast<double>(rand()) / RAND_MAX * total_weights;
+            next_centroid_index = -1;
+            for (int i = 0; i < N; i++) {
+                random_value -= weights[i];
+                if (random_value <= 0.0) {
+                    next_centroid_index = i;
+                    break;
+                }
+            }
+        }
+        MPI_Bcast(&next_centroid_index, 1, MPI_INT, root, comm);
+        //printf("Now on node: %d, total size: %d, %d centroid index: %d\n", rank, size, k, next_centroid_index);
+        for (int i = 0; i < D; i++) {
+            centroids[k][i] = points[next_centroid_index][i];
+            //printf("Now on node: %d, total size: %d, %d centroid %d value: %lf\n", rank, size, k, i, points[next_centroid_index][i]);
+        }
+        
+        
+    }
+}
+
+void arrange_cluster(double** centroids, double** local_points, 
+                    int N, int sub_N, int K, int D, int* local_cluster_index){
+
+    int rank;
+    MPI_Comm_rank(comm, &rank);
+
+    // split to clusters
+    for (int i = 0; i < sub_N; i++) {
+        double min_dist_sqr = INFINITY;
+        int min_cluster_index = 0;
+        for (int k = 0; k < K; k++){
+            double dist_sqr = 0.0;
+            for (int d = 0; d < D; d++){
+                double diff = local_points[i][d] - centroids[k][d];
+                dist_sqr += diff * diff;
+            }
+
+            if (dist_sqr < min_dist_sqr) {
+                min_dist_sqr = dist_sqr;
+                min_cluster_index = k;
+            }
+        }
+        local_cluster_index[i] = min_cluster_index;
+    }
+}
+
 int
 main (int argc, char **argv)
 {
@@ -266,26 +405,16 @@ main (int argc, char **argv)
     seed (&un, rank);
     int count = 0;
 
-
-    // real code
-    printf ("point generation starts\n");
-
     // points generated on each node
     sub_N = N / size;
 
     double *local_points_data = (double*)malloc(sub_N*D * sizeof(*local_points_data));
     double **local_points  = (double**)malloc(sub_N * sizeof(*local_points));
-
-    int gmm_index;
     for (int i = 0; i < sub_N; i++) {
         local_points[i] = &(local_points_data[i * D]);
-        gmm_index = findCumulativeProbabilityIndex(gmm_probs, c, i, sub_N);
-        
-        Gaussian_point (local_points[i], &un, D, gmm_means[gmm_index], gmm_stddevs[gmm_index]);
-        // printf ("gmm_index: %d ", gmm_index);
-        // for (int j = 0; j < D; j++) {printf ("%lf ", points[i][j]);}
-        // printf ("\n");
     }
+
+    generate_points(local_points, gmm_probs, gmm_means, gmm_stddevs, c, D, sub_N, un);
 
     // gather points
     double *points_data = (double*)malloc(N*D * sizeof(*points_data));
@@ -300,7 +429,11 @@ main (int argc, char **argv)
 
     // k-means++
     const int K = size; // Number of clusters
-    double centroids[K][D];
+    double *centroids_date = (double*)malloc(K*D * sizeof(*centroids_date));
+    double **centroids  = (double**)malloc(K * sizeof(*centroids));
+    for (int i = 0; i < K; i++) {
+        centroids[i] = &(centroids_date[i * D]);
+    }
     int first_centroid_index;
 
     if (rank == root) {
@@ -313,94 +446,17 @@ main (int argc, char **argv)
     for (int i = 0; i < D; i++) {
         centroids[0][i] = points[first_centroid_index][i];
     }
-    printf("Now on node: %d, total size: %d first centroid index: %d\n", rank, size, first_centroid_index);
 
-    // Initialize the remaining centroids using k-means++
-    for (int k = 1; k < K; k++) {
-        double weights[N];
-        double total_weights = 0.0;
-        double local_weights[sub_N];
-        double local_total_weight = 0.0;
+    generate_centroids(centroids, points, local_points, first_centroid_index, N, sub_N, rank, D, K);
 
-        // Find the data point farthest from the existing centroids
-        for (int i = 0; i < sub_N; i++) {
-            double min_dist_sqr = INFINITY;
-            
-            // find shortest distance to any centroid
-            for (int j = 0; j < k; j++) {
-                double dist_sqr = 0.0;
 
-                for (int d = 0; d < D; d++) {
-                    double diff = local_points[i][d] - centroids[j][d];
-                    dist_sqr += diff * diff;
-                }
-
-                if (dist_sqr < min_dist_sqr) {
-                    min_dist_sqr = dist_sqr;
-                }
-            }
-
-            local_weights[i] = min_dist_sqr;
-            local_total_weight += local_weights[i];
-        }
-
-        MPI_Gather(local_weights, sub_N, MPI_DOUBLE, weights, sub_N, MPI_DOUBLE, root, comm);
-        MPI_Reduce(&local_total_weight, &total_weights, 1, MPI_DOUBLE, MPI_SUM, root, comm);
-
-        if (rank == root) {
-            double tmp = 0.0;
-            for (int i = 0; i < N; i++){
-                tmp += weights[i];
-            }
-            printf("tmp: %lf, total_weights: %lf\n", tmp, total_weights);
-            // assert(tmp == total_weights);
-        }
-
-        int next_centroid_index;
-
-        if (rank == root) {
-            // Set the next centroid to the selected data point
-            double random_value = static_cast<double>(rand()) / RAND_MAX * total_weights;
-            next_centroid_index = -1;
-            for (int i = 0; i < N; i++) {
-                random_value -= weights[i];
-                if (random_value <= 0.0) {
-                    next_centroid_index = i;
-                    break;
-                }
-            }
-        }
-        MPI_Bcast(&next_centroid_index, 1, MPI_INT, root, comm);
-        //printf("Now on node: %d, total size: %d, %d centroid index: %d\n", rank, size, k, next_centroid_index);
-        for (int i = 0; i < D; i++) {
-            centroids[k][i] = points[next_centroid_index][i];
-            //printf("Now on node: %d, total size: %d, %d centroid %d value: %lf\n", rank, size, k, i, points[next_centroid_index][i]);
-        }
-        
-        
-    }
-
+    // arrange to clusters
     int local_cluster_index[sub_N];
     int cluster_index[N];
 
-    // split to clusters
-    for (int i = 0; i < sub_N; i++) {
-        double min_dist_sqr = INFINITY;
-        int min_cluster_index = 0;
-        for (int k = 0; k < K; k++){
-            double dist_sqr = 0.0;
-            for (int d = 0; d < D; d++){
-                double diff = local_points[i][d] - centroids[k][d];
-                dist_sqr += diff * diff;
-            }
+    arrange_cluster(centroids, local_points, N, sub_N, K, D, local_cluster_index);
 
-            if (dist_sqr < min_dist_sqr) {
-                min_dist_sqr = dist_sqr;
-                min_cluster_index = k;
-            }
-        }
-        local_cluster_index[i] = min_cluster_index;
-    }
+    // scatter clusters
 
     int local_size = 0;
     MPI_Allgather(local_cluster_index, sub_N, MPI_INT, cluster_index, sub_N, MPI_INT, comm);
@@ -465,30 +521,12 @@ main (int argc, char **argv)
     );
 
     MPI_Barrier(comm);
-    // if (rank != root) return 0;
-    // for (int i = 0; i < N; i++){for (int j = 0; j < D; j++) {printf ("%lf ", points[i][j]);}printf ("\n");}
-    // return 0;
 
-    // test tree
-    // use center of cluster as center for tree
-    // if (rank == root){  for (int i = 0; i < N; i++){for (int j = 0; j < D; j++) {printf ("%lf ", points[i][j]);}printf ("\n");} } 
+    // start of stimulation
     std::vector<double> rootCenter(D, 0.0);
     for (int i = 0; i < D; i++) {
         rootCenter[i] = centroids[rank][i];
     }
-
-    QuadTreeNode *tree_root = new QuadTreeNode(rootCenter, 50.0);
-    for (int i = 0; i < local_size; i++) {
-        insert(tree_root, cluster_points[i], D, 0);
-    }
-    calculate_mass_center(tree_root, D); // compute mass center
-    printf("Now on node: %d, total size: %d cluster mass: %lf\n", rank, size, tree_root->mass);
-    delete tree_root;
-    
-
-    // return 0;
-
-    
     int loops = MAX_LOOP;
 
     // velocity
@@ -510,13 +548,8 @@ main (int argc, char **argv)
         }
     }
     
-    // if (rank != root) return 0;
-    // stimulate gravity
-    double mean = getMean(points, N, D);
-    printf("mean distance: %lf\n", mean);
     
     double startVariance = compute_variance(points, N, D);
-    printf("stimulation starts, current variance: %lf\n", startVariance);
     
     int start_index = point_displacements[rank];
     for (int i = 0; i < local_size; i++) {
@@ -530,41 +563,7 @@ main (int argc, char **argv)
     while(loops){
         loops--;
         memset(force_data, 0, N*D*sizeof(*force_data));
-        for (int i = 0; i < N; i++) {
-            for (int j=0; j<D;j++){
-                assert(force[i][j] == 0);
-            }
-        }
-
-        // Build the tree
-        QuadTreeNode *tree_root = new QuadTreeNode(rootCenter, 50.0);
-        for (int i = 0; i < local_size; i++) {
-            insert(tree_root, cluster_points[i], D, 0);
-        }
-        calculate_mass_center(tree_root, D); // compute mass center
-
-        #pragma omp parallel for
-        for (int i = 0; i < N; i++) {
-            // assert(cluster_points[i][0] == points[start_index+i][0]);
-            calculate_local_force(tree_root, points[i], D, 0.3, G, force[i]);
-        }
-        MPI_Allreduce(MPI_IN_PLACE, force_data, N*D, MPI_DOUBLE, MPI_SUM, comm);
-
-        #pragma omp parallel for
-        for (int i = 0; i < local_size; i++){
-            for (int j = 0; j < D; j++) {
-                velocity[i][j] += force[start_index+i][j] / MASS * dt;
-            }
-        }
-
-        #pragma omp parallel for
-        for (int i = 0; i < local_size; i++){
-            for (int j = 0; j < D; j++) {
-                cluster_points[i][j] += velocity[i][j] * dt;
-            }
-        }
-
-        delete tree_root;
+        update_position(points, cluster_points, velocity, force_data, force, N, D, local_size, start_index, rootCenter);
 
         MPI_Allgatherv(
             cluster_points_data,

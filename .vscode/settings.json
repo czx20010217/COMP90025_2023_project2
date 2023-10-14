@@ -43,7 +43,8 @@
         "streambuf": "cpp",
         "typeinfo": "cpp",
         "iostream": "cpp",
-        "istream": "cpp"
+        "istream": "cpp",
+        "cstring": "cpp"
     },
     "C_Cpp.default.compilerPath": "D:\\Program Files (x86)\\winlibs-x86_64-posix-seh-gcc-12.3.0-llvm-16.0.4-mingw-w64ucrt-11.0.0-r1\\mingw64\\bin\\g++.exe"
 }
