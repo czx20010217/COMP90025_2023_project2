@@ -14,6 +14,10 @@ constexpr double EPSILON = 0.01;
 const MPI_Comm comm = MPI_COMM_WORLD;
 const int root = 0;
 const double MASS = 1000.0;
+// constant
+const double dt = 1;
+const double G = 6.67430e-11;
+const int MAX_LOOP = 1000;
 
 // It would be cleaner to put seed and Gaussian_point into this class,
 // but this allows them to be called like regular C functions.
@@ -127,11 +131,11 @@ struct QuadTreeNode {
 
 void insert(QuadTreeNode* node, double* point, int D, int reinsert) {
     if (node->mass == 0) {
-        node->mass = 1;
+        node->mass = MASS;
         node->point = point;
         return;
     }else if (!reinsert){
-        node->mass += 1;
+        node->mass += MASS;
     }
 
     if (node->point != nullptr) {
@@ -484,10 +488,8 @@ main (int argc, char **argv)
 
     // return 0;
 
-    const double dt = 0.1;
-    int loops = 10000;
-    // Gravitational constant
-    const double G = 6.67430e-11;
+    
+    int loops = MAX_LOOP;
 
     // velocity
     double *velocity_data = (double*)malloc(N*D * sizeof(*velocity_data));
@@ -541,22 +543,24 @@ main (int argc, char **argv)
         }
         calculate_mass_center(tree_root, D); // compute mass center
 
+        #pragma omp parallel for
         for (int i = 0; i < N; i++) {
             // assert(cluster_points[i][0] == points[start_index+i][0]);
             calculate_local_force(tree_root, points[i], D, 0.3, G, force[i]);
         }
         MPI_Allreduce(MPI_IN_PLACE, force_data, N*D, MPI_DOUBLE, MPI_SUM, comm);
 
+        #pragma omp parallel for
         for (int i = 0; i < local_size; i++){
             for (int j = 0; j < D; j++) {
                 velocity[i][j] += force[start_index+i][j] / MASS * dt;
             }
         }
 
+        #pragma omp parallel for
         for (int i = 0; i < local_size; i++){
             for (int j = 0; j < D; j++) {
                 cluster_points[i][j] += velocity[i][j] * dt;
-                assert((cluster_points[i][j] <= 20) && (cluster_points[i][j] >= -20));
             }
         }
 
@@ -585,13 +589,13 @@ main (int argc, char **argv)
                 printf("current variance: %lf\n", variance);
                 printf("end\n");
                 isSolutionFound = 1;
-            } else if (factor < 0.25){
+            } else if (factor < 0.5){
                 printf("failed, start variance: %lf, current variance: %lf, factor: %lf\n", startVariance, variance, factor);
                 printf("current variance: %lf\n", variance);
                 printf("failed\n");
                 isSolutionFound = 1;
             }
-            if (count == 500){
+            if (count == 50){
                 printf("current variance: %lf\n", variance);
                 count =  0;
             }
@@ -603,7 +607,10 @@ main (int argc, char **argv)
                 std::cout << "Root process found the solution." << std::endl;
             }
             std::cout << "Process " << rank << " terminates." << std::endl;
+            MPI_Finalize();
             return 0;
         }
     }
+    MPI_Finalize();
+    return 0;
 }
