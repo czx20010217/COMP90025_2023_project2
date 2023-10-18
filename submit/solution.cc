@@ -1,3 +1,24 @@
+/// Author: Zixuan Cheng
+/// Student id: 1165964
+/// Spartan id: zixuacheng
+/// Email: zixuacheng@student.unimelb.edu.au
+
+/// to run this code, either compile with "make solution" or "mpicxx -std=c++14 -fopenmp -g -O3 -o solution ./solution.cc"
+/// to run an test case, run command "mpirun -np NUMBER_OF_NDOE ./solution INPUTFILE ITERATION THETA", 
+/// replace NUMBER_OF_NDOE with a an integer as the number of nodes the program should run on
+/// replace INPUTFILE with a path to test file
+/// replace ITERATION with an integer as number of iterations wish to run, by default it is set be 1000
+/// replace THETA with the an float as accuracy parameter for Barnes-Hut Algorithm, by default it is set be 0.5
+/// provided test files are 100_points.txt, 100_points.txt, 1000_points.txt, 5000_points.txt, 10000_points.txt, 100000_points.txt, 1000000_points.txt
+/// all of them are in 4 dimension, with 4 component GMM and will generate number of points specified by their name
+/// example usage: 
+/// make solution
+/// solution 5000_points.txt 5000 0.9
+
+/// there are three experiments described in the report, they can be repeated using the three experiment-n.sh script on spartan
+/// by running command sbatch experiment-n.sh on spartan
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <random>
@@ -9,6 +30,9 @@
 #include <omp.h>
 #include <assert.h>
 #include <unistd.h> 
+#include <time.h>       // for clock()
+#include <sys/time.h>       // for clock()
+#include <string>
 
 constexpr double EPSILON = 0.01;
 const MPI_Comm comm = MPI_COMM_WORLD;
@@ -19,7 +43,7 @@ const double dt = 1;
 const double G = 6.67430e-11;
 const int MAX_LOOP = 1000;
 const double SIZE = 50.0;
-const double THETA = 0.3;
+const double THETA = 0.5;
 
 // It would be cleaner to put seed and Gaussian_point into this class,
 // but this allows them to be called like regular C functions.
@@ -31,6 +55,15 @@ class unit_normal {
     void seed (long int s) { gen.seed (s); }
     double sample () { return d(gen); }
 };
+
+double get_wall_time() {
+    struct timeval time;
+    if (gettimeofday(&time,NULL)){
+        //  Handle error
+        return 0;
+    }
+    return (double)time.tv_sec + (double)time.tv_usec * .000001;
+}
 
 void
 seed (unit_normal *un, long int s) {
@@ -234,7 +267,7 @@ void calculate_mass_center(QuadTreeNode* node, int D) {
 }
 
 void update_position(double **points, double** cluster_points, double** velocity, double* force_data, 
-                    double **force, int N, int D, int local_size, int start_index, std::vector<double> root_center){
+                    double **force, int N, int D, int local_size, double theta, int start_index, std::vector<double> root_center){
 
     // Build the tree
     QuadTreeNode *tree_root = new QuadTreeNode(root_center, SIZE);
@@ -243,20 +276,22 @@ void update_position(double **points, double** cluster_points, double** velocity
     }
     calculate_mass_center(tree_root, D); // compute mass center
 
-    #pragma omp parallel for
-    for (int i = 0; i < N; i++) {
-        calculate_local_force(tree_root, points[i], D, THETA, G, force[i]);
+    int n;
+    #pragma omp parallel for private(n) shared(tree_root, points, D, theta, G, force) schedule(dynamic)
+    for (n = 0; n < N; n++) {
+        calculate_local_force(tree_root, points[n], D, theta, G, force[n]);
     }
+    
     MPI_Allreduce(MPI_IN_PLACE, force_data, N*D, MPI_DOUBLE, MPI_SUM, comm);
 
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (int i = 0; i < local_size; i++){
         for (int j = 0; j < D; j++) {
             velocity[i][j] += force[start_index+i][j] / MASS * dt;
         }
     }
 
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for (int i = 0; i < local_size; i++){
         for (int j = 0; j < D; j++) {
             cluster_points[i][j] += velocity[i][j] * dt;
@@ -365,12 +400,20 @@ int
 main (int argc, char **argv)
 {
     MPI_Init(&argc, &argv);
+
     int rank;
     MPI_Comm_rank(comm, &rank);
     int size;
     MPI_Comm_size(comm, &size);
 
-    printf("Now on node: %d, total size: %d\n", rank, size);
+    double generation_time = 0.0;
+    double k_mean_time = 0.0;
+    double stimulation_time = 0.0;
+    double checking_time = 0.0;
+
+    clock_t t = clock();
+    double w = get_wall_time ();
+    double start_w = get_wall_time ();
 
     // reading file will be performed on all node to reduce overhead
     int N, D, c;        // number of points, dimensions and GMM components
@@ -379,6 +422,17 @@ main (int argc, char **argv)
     if (argc < 2) {
         fprintf (stderr, "usage: %s [input_file]\n", argv[0]);
         exit (1);
+    }
+
+    int loop_setting = 0; // default running using MAX_LOOP
+    double theta_setting = THETA; // default accuracy parameter set as 0.3
+
+    if (argc >= 3) {
+        loop_setting = std::stoi(argv[2]);
+    }
+
+    if (argc >= 4) {
+        theta_setting = std::stold(argv[3]);
     }
 
     // Read number of points and dimension
@@ -406,6 +460,7 @@ main (int argc, char **argv)
     int count = 0;
 
     // points generated on each node
+    N = ((N + size - 1) / size) * size; // force N to be a multiple of size to generate equal number of points
     sub_N = N / size;
 
     double *local_points_data = (double*)malloc(sub_N*D * sizeof(*local_points_data));
@@ -426,8 +481,10 @@ main (int argc, char **argv)
     MPI_Allgather(local_points_data, sub_N * D, MPI_DOUBLE, points_data, sub_N * D, MPI_DOUBLE, comm);
     // if (rank == root){  for (int i = 0; i < N; i++){for (int j = 0; j < D; j++) {printf ("%lf ", points[i][j]);}printf ("\n");} } 
     MPI_Barrier(comm);
+    generation_time = get_wall_time() - w; // record points generation time
 
     // k-means++
+    w = get_wall_time ();
     const int K = size; // Number of clusters
     double *centroids_date = (double*)malloc(K*D * sizeof(*centroids_date));
     double **centroids  = (double**)malloc(K * sizeof(*centroids));
@@ -449,7 +506,6 @@ main (int argc, char **argv)
 
     generate_centroids(centroids, points, local_points, first_centroid_index, N, sub_N, rank, D, K);
 
-
     // arrange to clusters
     int local_cluster_index[sub_N];
     int cluster_index[N];
@@ -461,6 +517,7 @@ main (int argc, char **argv)
     int local_size = 0;
     MPI_Allgather(local_cluster_index, sub_N, MPI_INT, cluster_index, sub_N, MPI_INT, comm);
     // if (rank == root){  for (int i = 0; i < N; i++){printf ("%d ", cluster_index[i]);}printf ("\n");} 
+
 
     for (int i = 0; i < N; i++){
         if (cluster_index[i] == rank){
@@ -493,7 +550,11 @@ main (int argc, char **argv)
         total_size += sizes[i];
         data_sizes[i] = sizes[i]*D;
     }
-    assert(total_size == N);
+    
+    // adjust points number if points N / K is not an integer
+    if (!total_size == N){
+        N = total_size;
+    }
     //if (rank == root){  for (int i = 0; i < size; i++){printf ("%d ", data_sizes[i]);}printf ("\n");} 
 
     int displacements[size];
@@ -519,15 +580,24 @@ main (int argc, char **argv)
         MPI_DOUBLE,
         MPI_COMM_WORLD
     );
-
-    MPI_Barrier(comm);
+    k_mean_time = get_wall_time() - w;
+    w = get_wall_time ();
 
     // start of stimulation
     std::vector<double> rootCenter(D, 0.0);
     for (int i = 0; i < D; i++) {
         rootCenter[i] = centroids[rank][i];
     }
-    int loops = MAX_LOOP;
+
+    int loops;
+    int fix_loops = 0;
+    if (loop_setting == 0){
+        loops = MAX_LOOP;
+    }else{
+        loops = loop_setting;
+        fix_loops = 1;
+    }
+    
 
     // velocity
     double *velocity_data = (double*)malloc(N*D * sizeof(*velocity_data));
@@ -543,27 +613,23 @@ main (int argc, char **argv)
     double **force  = (double**)malloc(N * sizeof(*force)); 
     for (int i = 0; i < N; i++) {
         force[i] = &(force_data[i * D]);
-        for (int j=0; j<D;j++){
-            assert(force[i][j] == 0);
-        }
     }
     
     
     double startVariance = compute_variance(points, N, D);
+    if (rank == root) printf("start variance: %lf\n", startVariance);
     
     int start_index = point_displacements[rank];
-    for (int i = 0; i < local_size; i++) {
-        for (int j=0; j<D;j++){
-            assert(cluster_points[i][j] == points[start_index+i][j]);
-        }
-    }
     
+    int loop_count = 0;
     int anySolutionFound;
     int isSolutionFound = 0;
     while(loops){
         loops--;
+        loop_count++;
+        w = get_wall_time ();
         memset(force_data, 0, N*D*sizeof(*force_data));
-        update_position(points, cluster_points, velocity, force_data, force, N, D, local_size, start_index, rootCenter);
+        update_position(points, cluster_points, velocity, force_data, force, N, D, local_size, theta_setting, start_index, rootCenter);
 
         MPI_Allgatherv(
             cluster_points_data,
@@ -575,41 +641,75 @@ main (int argc, char **argv)
             MPI_DOUBLE,
             MPI_COMM_WORLD
         );
+        stimulation_time += get_wall_time() - w;
 
         
         // for (int i = 0; i < N; i++){for (int j = 0; j < D; j++) {printf ("%lf ", points[i][j]);}printf ("\n");}
         count += 1;
-
+        w = get_wall_time ();
         if (rank == root){
             double variance = compute_variance(points, N, D);
             // printf("current variance: %lf\n", variance);
             double factor = startVariance / variance;
-            if (factor > 4.0){
-                printf("current variance: %lf\n", variance);
-                printf("end\n");
-                isSolutionFound = 1;
-            } else if (factor < 0.5){
-                printf("failed, start variance: %lf, current variance: %lf, factor: %lf\n", startVariance, variance, factor);
-                printf("current variance: %lf\n", variance);
-                printf("failed\n");
-                isSolutionFound = 1;
+            if (!fix_loops){
+                isSolutionFound = 0; // force stimulation to run for fix number of loops
+                if (factor > 3.0){
+                    printf("success, start variance: %lf, current variance: %lf, factor: %lf\n", startVariance, variance, factor);
+                    printf("end\n");
+                    isSolutionFound = 1;
+                } else if (factor < 0.25){
+                    printf("failed, start variance: %lf, current variance: %lf, factor: %lf\n", startVariance, variance, factor);
+                    printf("current variance: %lf\n", variance);
+                    printf("failed\n");
+                    isSolutionFound = 1;
+                }
             }
+            
             if (count == 50){
                 printf("current variance: %lf\n", variance);
                 count =  0;
             }
+            
         }
-
+        
         MPI_Allreduce(&isSolutionFound, &anySolutionFound, 1, MPI_INT, MPI_MAX, comm);
+        checking_time += get_wall_time() - w;
         if (anySolutionFound || isSolutionFound) {
             if (rank == 0) {
                 std::cout << "Root process found the solution." << std::endl;
             }
             std::cout << "Process " << rank << " terminates." << std::endl;
-            MPI_Finalize();
-            return 0;
+            break;
         }
     }
+
+    // display time
+    double global_generation_time = 0.0;
+    double global_k_mean_time = 0.0;
+    double global_stimulation_time = 0.0;
+    double global_checking_time = 0.0;
+
+
+    MPI_Allreduce(&generation_time, &global_generation_time, 1, MPI_DOUBLE, MPI_SUM, comm);
+    MPI_Allreduce(&k_mean_time, &global_k_mean_time, 1, MPI_DOUBLE, MPI_SUM, comm);
+    MPI_Allreduce(&stimulation_time, &global_stimulation_time, 1, MPI_DOUBLE, MPI_SUM, comm);
+    MPI_Allreduce(&checking_time, &global_checking_time, 1, MPI_DOUBLE, MPI_SUM, comm);
+
     MPI_Finalize();
+
+    global_generation_time /= K;
+    global_k_mean_time /= K;
+    global_stimulation_time /= K;
+    global_checking_time /= K;
+
+    if (rank != root) return 0;
+
+    printf("loops runned: %d\n", loop_count);
+
+    printf("average generation time: %lf\n", global_generation_time);
+    printf("average k_mean time: %lf\n", global_k_mean_time);
+    printf("average stimulation time: %lf\n", global_stimulation_time);
+    printf("average checking time: %lf\n", global_checking_time);
+    printf("average overhead time: %lf\n", (get_wall_time() - start_w) - global_generation_time - global_k_mean_time - global_stimulation_time - global_checking_time);
     return 0;
 }
